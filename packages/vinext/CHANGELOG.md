@@ -1,5 +1,27 @@
 # vinext
 
+## 1.0.0-beta.1
+
+### Bug Fixes
+
+- **App Router:** handle redirects in route-miss fallbacks (#2553)
+- **App Router:** preserve semicolons in redirect digests (#2487)
+- pass server externals to Nitro traceDeps (#2521)
+- **Pages:** preserve fast refresh state (#2544)
+- **Build:** honor inline next config for static export (#2543)
+- **Routing:** discover dot-directory routes (#2531)
+
+### Performance
+
+- **Build:** use native typeof window folding (#2564)
+- **Pages:** reuse dev stylesheet dependency analysis (#2550)
+
+### Contributors
+
+- @james-elicx
+- @NathanDrake2406
+- @WilliamK112
+
 ## 1.0.0-beta.0
 
 ### Features
