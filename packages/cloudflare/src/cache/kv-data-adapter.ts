@@ -12,6 +12,19 @@ export type KvDataAdapterOptions = {
   ttlSeconds?: number;
   /** TTL in milliseconds for the in-memory tag-invalidation cache. @default 5000 */
   tagCacheTtlMs?: number;
+  /**
+   * KV `cacheTtl` in seconds for entry reads, letting a colo answer a repeat
+   * read from its local cache instead of the central store. Values below
+   * Cloudflare's 60s floor are raised to 60.
+   *
+   * Trade-off: after a `set()` or an eviction, a colo that already cached the
+   * key can serve the previous value for up to this long. Tag invalidation is
+   * unaffected — `revalidateTag()` / `revalidatePath()` write tag markers that
+   * `get()` reads separately, bounded by `tagCacheTtlMs`.
+   *
+   * @default undefined (every entry read goes to the central store)
+   */
+  entryCacheTtlSeconds?: number;
 };
 
 /**

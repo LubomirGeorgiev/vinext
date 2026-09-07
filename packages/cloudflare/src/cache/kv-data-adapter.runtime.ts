@@ -66,8 +66,13 @@ type SerializedIncrementalCacheValue =
 
 // Cloudflare KV namespace interface (matches Workers types)
 type KVNamespace = {
-  get(key: string, options?: { type?: string }): Promise<string | null>;
+  get(key: string, options?: { type?: string; cacheTtl?: number }): Promise<string | null>;
   get(key: string, options: { type: "arrayBuffer" }): Promise<ArrayBuffer | null>;
+  /** Bulk read (up to 100 keys per call). Absent on older runtimes and on test doubles. */
+  get(
+    keys: string[],
+    options?: { type?: string; cacheTtl?: number },
+  ): Promise<Map<string, string | null>>;
   put(
     key: string,
     value: string | ArrayBuffer | ReadableStream,
@@ -96,6 +101,12 @@ type KVCacheEntry = {
 
 /** Prefix used by revalidatePath for path-based tags. */
 const PATH_TAG_PREFIX = "_N_T_";
+
+/** Cloudflare rejects a `cacheTtl` below 60 seconds, so clamp up to the floor. */
+const MIN_KV_CACHE_TTL_SECONDS = 60;
+
+/** Cloudflare caps a bulk `get()` at 100 keys per call. */
+const KV_BULK_GET_LIMIT = 100;
 
 /** Max tag length to prevent KV key abuse. */
 const MAX_TAG_LENGTH = 256;
@@ -188,6 +199,12 @@ export class KVCacheHandler implements CacheHandler {
   /** TTL (ms) for local tag cache entries. After this, re-fetch from KV. */
   private _tagCacheTtl: number;
 
+  /** KV read options shared by entry and tag reads. `undefined` keeps the default (no colo cache). */
+  private _readOptions: { cacheTtl: number } | undefined;
+
+  /** Set once a bulk `get()` probe fails, so later tag reads go straight to per-key reads. */
+  private _bulkGetUnsupported = false;
+
   constructor(
     kvNamespace: KVNamespace,
     options?: {
@@ -196,6 +213,8 @@ export class KVCacheHandler implements CacheHandler {
       ttlSeconds?: number;
       /** TTL in milliseconds for the local tag cache. Defaults to 5000ms. */
       tagCacheTtlMs?: number;
+      /** KV `cacheTtl` in seconds for entry and tag reads. Off by default. */
+      entryCacheTtlSeconds?: number;
     },
   ) {
     this.kv = kvNamespace;
@@ -203,6 +222,11 @@ export class KVCacheHandler implements CacheHandler {
     this.ctx = options?.ctx;
     this.ttlSeconds = options?.ttlSeconds ?? 30 * 24 * 3600;
     this._tagCacheTtl = options?.tagCacheTtlMs ?? 5_000;
+    const entryCacheTtl = options?.entryCacheTtlSeconds;
+    this._readOptions =
+      entryCacheTtl === undefined || !Number.isFinite(entryCacheTtl)
+        ? undefined
+        : { cacheTtl: Math.max(MIN_KV_CACHE_TTL_SECONDS, Math.floor(entryCacheTtl)) };
   }
 
   private _entryKey(key: string): string {
@@ -215,7 +239,7 @@ export class KVCacheHandler implements CacheHandler {
 
   async get(key: string, _ctx?: Record<string, unknown>): Promise<CacheHandlerValue | null> {
     const kvKey = this._entryKey(key);
-    const raw = await this.kv.get(kvKey);
+    const raw = await this._readKey(kvKey);
     if (!raw) return null;
 
     let parsed: unknown;
@@ -287,6 +311,59 @@ export class KVCacheHandler implements CacheHandler {
     };
   }
 
+  /** Read one KV key, omitting the options argument entirely when none are set. */
+  private _readKey(key: string): Promise<string | null> {
+    return this._readOptions ? this.kv.get(key, this._readOptions) : this.kv.get(key);
+  }
+
+  /**
+   * Read the invalidation marker for each tag, in `tags` order.
+   *
+   * Prefers KV's bulk `get()` (one round trip per 100 keys) over one request
+   * per tag. Runtimes and test doubles that only accept a single string key
+   * return something other than a `Map`; remember that so the probe costs one
+   * extra read per handler at most, then always read per key.
+   */
+  private async _readTagMarkers(tags: string[]): Promise<(string | null)[]> {
+    const keys = tags.map((tag) => this._tagKey(tag));
+
+    const readEachKey = (): Promise<(string | null)[]> =>
+      Promise.all(keys.map((key) => this._readKey(key)));
+
+    if (keys.length === 1 || this._bulkGetUnsupported) {
+      return readEachKey();
+    }
+
+    const chunks: string[][] = [];
+    for (let i = 0; i < keys.length; i += KV_BULK_GET_LIMIT) {
+      chunks.push(keys.slice(i, i + KV_BULK_GET_LIMIT));
+    }
+
+    let results: Map<string, string | null>[];
+    try {
+      results = await Promise.all(
+        chunks.map((chunk) =>
+          this._readOptions ? this.kv.get(chunk, this._readOptions) : this.kv.get(chunk),
+        ),
+      );
+    } catch {
+      this._bulkGetUnsupported = true;
+      return readEachKey();
+    }
+    if (results.some((result) => !(result instanceof Map))) {
+      this._bulkGetUnsupported = true;
+      return readEachKey();
+    }
+
+    const merged = new Map<string, string | null>();
+    for (const result of results) {
+      for (const [key, value] of result) {
+        merged.set(key, value);
+      }
+    }
+    return keys.map((key) => merged.get(key) ?? null);
+  }
+
   /**
    * Check tag invalidation markers for stored tags or read-time soft tags.
    * Uses a local in-memory cache to avoid redundant KV reads for recently-seen tags.
@@ -317,9 +394,7 @@ export class KVCacheHandler implements CacheHandler {
     // Populate the local cache for ALL fetched tags before checking invalidation,
     // so subsequent get() calls benefit from the already-fetched results.
     if (uncachedTags.length > 0) {
-      const tagResults = await Promise.all(
-        uncachedTags.map((tag) => this.kv.get(this._tagKey(tag))),
-      );
+      const tagResults = await this._readTagMarkers(uncachedTags);
 
       for (let i = 0; i < uncachedTags.length; i++) {
         const tagTime = tagResults[i];
@@ -709,6 +784,7 @@ const createKvDataCacheAdapter = ({
     appPrefix: options?.appPrefix,
     ttlSeconds: options?.ttlSeconds,
     tagCacheTtlMs: options?.tagCacheTtlMs,
+    entryCacheTtlSeconds: options?.entryCacheTtlSeconds,
   });
 };
 

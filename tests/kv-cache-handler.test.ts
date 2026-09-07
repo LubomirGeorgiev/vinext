@@ -27,7 +27,13 @@ function createMockKV(store: Map<string, string> = new Map()) {
   const metadataStore = new Map<string, Record<string, unknown>>();
 
   return {
-    get: vi.fn(async (key: string) => store.get(key) ?? null),
+    // Mirrors Workers KV: an array of keys returns a Map, a single key a string.
+    get: vi.fn(async (key: string | string[]) => {
+      if (Array.isArray(key)) {
+        return new Map(key.map((k) => [k, store.get(k) ?? null]));
+      }
+      return store.get(key) ?? null;
+    }),
     put: vi.fn(
       async (
         key: string,
@@ -876,8 +882,9 @@ describe("KVCacheHandler", () => {
       const result1 = await handler.get("tagged-page");
       expect(result1).not.toBeNull();
 
-      // kv.get calls: 1 for the entry + 2 for the tags = 3
-      expect(kv.get).toHaveBeenCalledTimes(3);
+      // kv.get calls: 1 for the entry + 1 bulk read for both tags = 2
+      expect(kv.get).toHaveBeenCalledTimes(2);
+      expect(kv.get).toHaveBeenCalledWith(["__tag:t1", "__tag:t2"]);
 
       // Reset call counts
       kv.get.mockClear();
@@ -1060,10 +1067,10 @@ describe("KVCacheHandler", () => {
         }),
       );
 
-      // First get() — populates local tag cache (1 entry + 2 tags = 3 calls)
+      // First get() — populates local tag cache (1 entry + 1 bulk tag read = 2 calls)
       const result1 = await handler.get("reset-page");
       expect(result1).not.toBeNull();
-      expect(kv.get).toHaveBeenCalledTimes(3);
+      expect(kv.get).toHaveBeenCalledTimes(2);
       kv.get.mockClear();
 
       // Second get() without reset — tags served from local cache (1 entry only)
@@ -1075,13 +1082,89 @@ describe("KVCacheHandler", () => {
       // Clear the local cache
       handler.resetRequestCache();
 
-      // Third get() after reset — tags must be re-fetched from KV (1 entry + 2 tags = 3 calls)
+      // Third get() after reset — tags must be re-fetched (1 entry + 1 bulk tag read = 2 calls)
       const result3 = await handler.get("reset-page");
       expect(result3).not.toBeNull();
-      expect(kv.get).toHaveBeenCalledTimes(3);
+      expect(kv.get).toHaveBeenCalledTimes(2);
       expect(kv.get).toHaveBeenCalledWith("cache:reset-page");
+      expect(kv.get).toHaveBeenCalledWith(["__tag:t1", "__tag:t2"]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // KV read options
+  // -------------------------------------------------------------------------
+  describe("read options", () => {
+    function seedTaggedEntry(store: Map<string, string>, key: string) {
+      store.set(
+        `cache:${key}`,
+        JSON.stringify({
+          value: { kind: "PAGES", html: "<p>hi</p>", pageData: {}, status: 200 },
+          tags: ["t1", "t2"],
+          lastModified: Date.now(),
+          revalidateAt: null,
+        }),
+      );
+    }
+
+    it("omits the options argument entirely when entryCacheTtlSeconds is unset", async () => {
+      const store = new Map<string, string>();
+      const kv = createMockKV(store);
+      seedTaggedEntry(store, "no-ttl");
+
+      const handler = new KVCacheHandler(kv as never);
+      expect(await handler.get("no-ttl")).not.toBeNull();
+
+      for (const call of kv.get.mock.calls) {
+        expect(call).toHaveLength(1);
+      }
+    });
+
+    it("passes cacheTtl on entry and tag reads when entryCacheTtlSeconds is set", async () => {
+      const store = new Map<string, string>();
+      const kv = createMockKV(store);
+      seedTaggedEntry(store, "ttl");
+
+      const handler = new KVCacheHandler(kv as never, { entryCacheTtlSeconds: 300 });
+      expect(await handler.get("ttl")).not.toBeNull();
+
+      expect(kv.get).toHaveBeenCalledWith("cache:ttl", { cacheTtl: 300 });
+      expect(kv.get).toHaveBeenCalledWith(["__tag:t1", "__tag:t2"], { cacheTtl: 300 });
+    });
+
+    it("raises a cacheTtl below Cloudflare's 60s floor", async () => {
+      const store = new Map<string, string>();
+      const kv = createMockKV(store);
+      seedTaggedEntry(store, "floor");
+
+      const handler = new KVCacheHandler(kv as never, { entryCacheTtlSeconds: 5 });
+      expect(await handler.get("floor")).not.toBeNull();
+
+      expect(kv.get).toHaveBeenCalledWith("cache:floor", { cacheTtl: 60 });
+    });
+
+    it("falls back to per-key tag reads when the namespace has no bulk get", async () => {
+      const store = new Map<string, string>();
+      const kv = createMockKV(store);
+      // A namespace that ignores the array form, like an older runtime or a test double.
+      kv.get = vi.fn(async (key: string | string[]) =>
+        Array.isArray(key) ? null : (store.get(key) ?? null),
+      ) as never;
+      seedTaggedEntry(store, "no-bulk");
+
+      const handler = new KVCacheHandler(kv as never);
+      expect(await handler.get("no-bulk")).not.toBeNull();
+
       expect(kv.get).toHaveBeenCalledWith("__tag:t1");
       expect(kv.get).toHaveBeenCalledWith("__tag:t2");
+
+      // The failed probe is remembered: a later read goes straight to per-key.
+      handler.resetRequestCache();
+      (kv.get as ReturnType<typeof vi.fn>).mockClear();
+      expect(await handler.get("no-bulk")).not.toBeNull();
+      for (const call of (kv.get as ReturnType<typeof vi.fn>).mock.calls) {
+        expect(Array.isArray(call[0])).toBe(false);
+      }
     });
   });
 
